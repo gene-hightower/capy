@@ -1,0 +1,338 @@
+= ReadStream Concept Design
+
+== Overview
+
+This document describes the design of the `ReadStream` concept: the fundamental partial-read primitive in the concept hierarchy. It explains why `read_some` is the correct building block, how composed algorithms build on top of it, and the relationship to `ReadSource`.
+
+== Definition
+
+[source,cpp]
+----
+template<typename T>
+concept ReadStream =
+    requires(T& stream, mutable_buffer_archetype buffers)
+    {
+        { stream.read_some(buffers) } -> IoAwaitable;
+        requires awaitable_decomposes_to<
+            decltype(stream.read_some(buffers)),
+            std::error_code, std::size_t>;
+    };
+----
+
+A `ReadStream` provides a single operation:
+
+=== `read_some(buffers)` -- Partial Read
+
+Attempts to read up to `buffer_size(buffers)` bytes from the stream into the buffer sequence. Returns `(error_code, std::size_t)` where `n` is the number of bytes read.
+
+==== Semantics
+
+If `buffer_size(buffers) > 0`:
+
+- If `!ec`, then `n >= 1 && n \<= buffer_size(buffers)`. `n` bytes were read into the buffer sequence.
+- If `ec`, then `n >= 0 && n \<= buffer_size(buffers)`. `n` is the number of bytes read before the I/O condition arose.
+
+If `buffer_empty(buffers)` is true, `n` is 0. The empty buffer is not itself a cause for error, but `ec` may reflect the state of the stream.
+
+The caller must not assume the buffer is filled. `read_some` may return fewer bytes than the buffer can hold. This is the defining property of a partial-read primitive.
+
+Once `read_some` returns an error (including EOF), the caller must not call `read_some` again. The stream is done. Not all implementations can reproduce a prior error on subsequent calls, so the behavior after an error is undefined.
+
+Buffers in the sequence are filled in order.
+
+==== Error Reporting
+
+I/O conditions arising from the underlying I/O system (EOF, connection reset, broken pipe, etc.) are reported via the `error_code` component of the return value. Failures in the library wrapper itself (such as memory allocation failure) are reported via exceptions.
+
+*Throws:* `std::bad_alloc` if coroutine frame allocation fails.
+
+==== Buffer Lifetime
+
+The caller must ensure that the memory referenced by `buffers` remains valid until the `co_await` expression returns.
+
+==== Conforming Signatures
+
+[source,cpp]
+----
+template<MutableBufferSequence Buffers>
+IoAwaitable auto read_some(Buffers buffers);
+----
+
+Buffer sequences should be accepted by value when the member function is a coroutine, to ensure the sequence lives in the coroutine frame across suspension points.
+
+== Concept Hierarchy
+
+`ReadStream` is the base of the read-side hierarchy:
+
+----
+ReadStream    { read_some }
+    |
+    v
+ReadSource    { read_some, read }
+----
+
+`ReadSource` refines `ReadStream`. Every `ReadSource` is a `ReadStream`. Algorithms constrained on `ReadStream` accept both raw streams and sources. The `ReadSource` concept adds a complete-read primitive on top of the partial-read primitive.
+
+This mirrors the write side:
+
+----
+WriteStream   { write_some }
+    |
+    v
+WriteSink     { write_some, write, write_eof(buffers), write_eof() }
+----
+
+== Composed Algorithms
+
+Three composed algorithms build on `read_some`:
+
+=== `read(stream, buffers)` -- Fill a Buffer Sequence
+
+[source,cpp]
+----
+auto read(ReadStream auto& stream,
+          MutableBufferSequence auto const& buffers)
+    -> io_task<std::size_t>;
+----
+
+Loops `read_some` until the entire buffer sequence is filled or an error (including EOF) occurs. On success, `n == buffer_size(buffers)`.
+
+[source,cpp]
+----
+template<ReadStream Stream>
+task<> read_header(Stream& stream)
+{
+    char header[16];
+    auto [ec, n] = co_await read(
+        stream, mutable_buffer(header));
+    if(ec == cond::eof)
+        co_return;  // clean shutdown
+    if(ec)
+        co_return;
+    // header contains exactly 16 bytes
+}
+----
+
+=== `read(stream, dynamic_buffer)` -- Read Until EOF
+
+[source,cpp]
+----
+auto read(ReadStream auto& stream,
+          DynamicBufferParam auto&& buffers,
+          std::size_t initial_amount = 2048)
+    -> io_task<std::size_t>;
+----
+
+Reads from the stream into a dynamic buffer until EOF is reached. The buffer grows with a 1.5x factor when filled. On success (EOF), `ec` is clear and `n` is the total bytes read.
+
+[source,cpp]
+----
+template<ReadStream Stream>
+task<std::string> slurp(Stream& stream)
+{
+    std::string body;
+    auto [ec, n] = co_await read(
+        stream, string_dynamic_buffer(&body));
+    if(ec)
+        co_return {};
+    co_return body;
+}
+----
+
+=== `read_until(stream, dynamic_buffer, match)` -- Delimited Read
+
+Reads from the stream into a dynamic buffer until a delimiter or match condition is found. Used for line-oriented protocols and message framing.
+
+[source,cpp]
+----
+template<ReadStream Stream>
+task<> read_line(Stream& stream)
+{
+    std::string line;
+    auto [ec, n] = co_await read_until(
+        stream, string_dynamic_buffer(&line), "\r\n");
+    if(ec)
+        co_return;
+    // line contains data up to and including "\r\n"
+}
+----
+
+== Use Cases
+
+=== Incremental Processing with `read_some`
+
+When processing data as it arrives without waiting for a full buffer, `read_some` is the right choice. This is common for real-time data or when the processing can handle partial input.
+
+[source,cpp]
+----
+template<ReadStream Stream>
+task<> echo(Stream& stream, WriteStream auto& dest)
+{
+    char buf[4096];
+    for(;;)
+    {
+        auto [ec, n] = co_await stream.read_some(
+            mutable_buffer(buf));
+
+        auto [wec, nw] = co_await dest.write_some(
+            const_buffer(buf, n));
+
+        if(ec)
+            co_return;
+
+        if(wec)
+            co_return;
+    }
+}
+----
+
+=== Relaying from ReadStream to WriteStream
+
+When relaying data from a reader to a writer, `read_some` feeds `write_some` directly. This is the fundamental streaming pattern.
+
+[source,cpp]
+----
+template<ReadStream Src, WriteStream Dest>
+task<> relay(Src& src, Dest& dest)
+{
+    char storage[65536];
+    circular_dynamic_buffer cb(storage, sizeof(storage));
+
+    for(;;)
+    {
+        // Read into free space
+        auto mb = cb.prepare(cb.capacity());
+        auto [rec, nr] = co_await src.read_some(mb);
+        cb.commit(nr);
+
+        if(rec && rec != cond::eof)
+            co_return;
+
+        // Drain to destination
+        while(cb.size() > 0)
+        {
+            auto [wec, nw] = co_await dest.write_some(
+                cb.data());
+            if(wec)
+                co_return;
+            cb.consume(nw);
+        }
+
+        if(rec == cond::eof)
+            co_return;
+    }
+}
+----
+
+Because `ReadSource` refines `ReadStream`, this relay function also accepts `ReadSource` types. An HTTP body source or a decompressor can be relayed to a `WriteStream` using the same function.
+
+== Relationship to the Write Side
+
+[cols="1,1"]
+|===
+| Read Side | Write Side
+
+| `ReadStream::read_some`
+| `WriteStream::write_some`
+
+| `read` free function (composed)
+| `write_now` (composed, eager)
+
+| `read_until` (composed, delimited)
+| No write-side equivalent
+
+| `ReadSource::read`
+| `WriteSink::write`
+|===
+
+== Design Foundations: Why Errors May Accompany Data
+
+The `read_some` contract permits `n > 0` when `ec` is set. Data and errors are not mutually exclusive: the implementation reports exactly what happened. This is the most consequential design decision in the `ReadStream` concept, with implications for every consumer of `read_some` in the library. This section explains the design and its consequences.
+
+=== The Return Type's Purpose
+
+POSIX `read(2)` returns a single `ssize_t` -- either a byte count or -1 with `errno`. It cannot report both a byte count and an error simultaneously. When a partial transfer occurs before an error, POSIX returns the byte count on the current call and defers the error to the next. The `(error_code, size_t)` return type was designed to transcend this limitation. It can carry both values at once, allowing implementations to report partial transfers alongside the condition that stopped the transfer, as a single result.
+
+=== Departing from Asio
+
+Asio's `AsyncReadStream` concept requires `bytes_transferred == 0` on error. This was a reasonable design for an API built around POSIX-like streams, where the underlying system calls enforce binary outcomes per call. However, it imposes a burden on layered streams that do not share this limitation.
+
+A TLS stream might decrypt 100 bytes into user space, then receive a fatal alert on the next record. Under the strict rule it must either report `(!ec, 100)` now and `(ec, 0)` on the next call (requiring deferred-error bookkeeping), or report `(ec, 0)` and discard 100 valid bytes. Neither is clean. Under the relaxed rule, the TLS stream reports `(ec, 100)` honestly: here are the bytes that arrived, and here is the condition that stopped the transfer.
+
+The `ReadStream` concept permits both behaviors. Streams that naturally produce `(ec, 0)` on error (such as POSIX socket wrappers) conform. Streams that report `(ec, n)` with `n > 0` (such as TLS or compression layers) also conform. The concept imposes the weakest postcondition that all conforming types can satisfy.
+
+=== The Empty-Buffer Rule
+
+When `buffer_empty(buffers)` is true, `n` is 0. The empty buffer is not itself a cause for error, but `ec` may reflect the state of the stream.
+
+Whether the implementation performs a system call for a zero-length buffer is unspecified. A concrete type that short-circuits with `(!ec, 0)` conforms. A concrete type that forwards the zero-length call to the OS and reports whatever condition arises also conforms. The concept leaves this to the implementation.
+
+This flexibility permits zero-length operations to serve as probes (fd validation, broken pipe detection) on implementations that support it, without the concept forbidding the resulting error.
+
+=== Why EOF Is an Error
+
+EOF is reported as an error code (`cond::eof`) rather than as a success with `n == 0`, for two reasons:
+
+*Composed operations need EOF-as-error to report early termination.* The composed `read(stream, buffer(buf, 100))` promises to fill exactly 100 bytes. If the stream ends after 50, the operation did not fulfill its contract. Reporting `{success, 50}` would be misleading. Reporting `{eof, 50}` tells the caller both what happened (50 bytes landed in the buffer) and why the operation stopped (the stream ended).
+
+*EOF-as-error disambiguates the empty-buffer case from the end of a stream.* Without EOF-as-error, both `read_some(empty_buffer)` on a live stream and `read_some(non_empty_buffer)` on an exhausted stream could produce `{success, 0}`. The caller could not distinguish "I passed no buffer" from "the stream is done."
+
+=== The Canonical I/O Loop
+
+Every composed read algorithm that accumulates progress follows the same pattern:
+
+[source,cpp]
+----
+auto [ec, n] = co_await s.read_some(
+    mutable_buffer(buf + total, size - total));
+total += n;
+if(ec)
+    co_return;
+----
+
+The advance-then-check ordering is the only correct pattern. It is required for any operation that can report partial progress alongside an error -- `read` returning `(eof, 47)` being the canonical example. If the check precedes the advance, the 47 bytes are silently dropped.
+
+Under the strict rule (`n == 0` on error), the advance is a harmless no-op. Under the relaxed rule (`n >= 0` on error), the advance captures partial progress. The caller writes identical code either way. The perceived simplification of the strict rule exists only if the caller writes the check-then-advance anti-pattern, which is already incorrect for other reasons.
+
+=== Implementer Freedom
+
+Under the strict rule, every stream that might encounter an error after a partial transfer must choose between:
+
+- **Deferred errors.** Report `(!ec, k)` now, remember the error, and report `(ec, 0)` on the next call. This requires per-stream state and makes the stream's behavior depend on call history.
+- **Data loss.** Report `(ec, 0)` and discard the `k` bytes that were transferred.
+- **Internal buffering.** Copy the `k` bytes into an internal buffer and replay them on the next call. This adds allocation and copying overhead.
+
+Under the relaxed rule, the implementation reports what happened: `(ec, k)`. No deferred state, no data loss, no internal buffering.
+
+=== Consistency from Primitives Through Composed Operations
+
+The strict postcondition on `read_some` does not propagate to composed operations. The composed `read` returns `(ec, m)` where `m > 0` on failure, because it accumulates data across multiple internal `read_some` calls. The `(ec, n > 0)` case that the strict rule eliminates from `read_some` is immediately reintroduced one layer up.
+
+The relaxed postcondition avoids this inconsistency. Partial progress alongside an error code is the same pattern at every level -- from `read_some` through composed `read` -- rather than being forbidden at the primitive level and required at the composed level.
+
+=== Conforming Sources
+
+Concrete `ReadStream` implementations are free to report `n == 0` or `n > 0` on error, whichever is natural:
+
+- **TCP sockets**: `read_some` maps to a single `recv()` or `WSARecv()` call. POSIX and Windows enforce binary outcomes, so these naturally produce `(ec, 0)` on error.
+- **TLS streams**: `read_some` decrypts application data. If a fatal alert arrives after decrypting a partial record, the implementation may report `(ec, n)` with the bytes that were decrypted.
+- **HTTP content-length body**: delivers bytes up to the content-length limit. Once the limit is reached, the next `read_some` returns EOF.
+- **HTTP chunked body**: the unchunker delivers decoded data from chunks. The terminal `0\r\n\r\n` is parsed on a separate pass that returns EOF.
+- **Compression (inflate)**: the decompressor delivers output bytes. `Z_STREAM_END` may arrive alongside the final output, allowing `(eof, n)` with the last bytes.
+- **Memory source**: returns `min(requested, remaining)` bytes. May report `(eof, n)` on the final call when remaining is known, or `(eof, 0)` on a subsequent call.
+- **QUIC streams**: `read_some` returns data from received QUIC frames. Stream FIN may arrive with the last data, allowing `(eof, n)`.
+- **Buffered read streams**: `read_some` returns data from an internal buffer. EOF propagates from the underlying stream.
+- **Test mock streams**: `read_some` returns configurable data and error sequences for testing.
+
+No source is forced into an unnatural pattern. Sources that naturally separate data from errors continue to do so. Sources that naturally discover errors alongside data are free to report both.
+
+== Summary
+
+`ReadStream` provides `read_some` as the single partial-read primitive. This is deliberately minimal:
+
+- Algorithms that need to fill a buffer completely use the `read` composed algorithm.
+- Algorithms that need delimited reads use `read_until`.
+- Algorithms that need to process data as it arrives use `read_some` directly.
+- `ReadSource` refines `ReadStream` by adding `read` for complete-read semantics.
+
+The contract permits errors to accompany partial data. This uses the richer `(error_code, size_t)` return type to its full potential, avoids forcing non-POSIX streams into a deferred-error model, and produces a postcondition that is consistent from `read_some` through composed operations. The canonical advance-then-check loop handles both cases correctly with no additional call-site cost.
