@@ -1,0 +1,191 @@
+= Echo Server with Corosio
+
+A complete echo server using Corosio for real network I/O.
+
+== What You Will Learn
+
+* Integrating Capy with Corosio networking
+* Accepting TCP connections with `tcp_acceptor`
+* Handling multiple clients concurrently
+
+== Prerequisites
+
+* Completed xref:7.examples/7h.custom-dynamic-buffer.adoc[Custom Dynamic Buffer]
+* Corosio library installed
+* Understanding of TCP networking basics
+
+== Source Code
+
+[source,cpp]
+----
+#include <boost/capy.hpp>
+#include <boost/corosio.hpp>
+#include <iostream>
+
+namespace corosio = boost::corosio;
+namespace capy = boost::capy;
+
+capy::task<> echo_session(corosio::tcp_socket sock)
+{
+    char buf[1024];
+
+    for (;;)
+    {
+        auto [ec, n] = co_await sock.read_some(
+            capy::mutable_buffer(buf, sizeof(buf)));
+
+        auto [wec, wn] = co_await capy::write(
+            sock, capy::const_buffer(buf, n));
+
+        if (ec)
+            break;
+
+        if (wec)
+            break;
+    }
+
+    sock.close();
+}
+
+capy::task<> accept_loop(
+    corosio::tcp_acceptor& acc,
+    corosio::io_context& ioc)
+{
+    auto ep = acc.local_endpoint();
+    std::cout << "Listening on port " << ep.port() << "\n";
+
+    for (;;)
+    {
+        corosio::tcp_socket peer(ioc);
+        auto [ec] = co_await acc.accept(peer);
+
+        if (ec)
+        {
+            std::cout << "Accept error: " << ec.message() << "\n";
+            continue;
+        }
+
+        auto remote = peer.remote_endpoint();
+        std::cout << "Connection from ";
+        if (remote.is_v4())
+            std::cout << remote.v4_address();
+        else
+            std::cout << remote.v6_address();
+        std::cout << ":" << remote.port() << "\n";
+
+        capy::run_async(ioc.get_executor())(
+            echo_session(std::move(peer)));
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    unsigned short port = 8080;
+    if (argc > 1)
+        port = static_cast<unsigned short>(std::atoi(argv[1]));
+
+    corosio::io_context ioc;
+    corosio::tcp_acceptor acc(ioc, corosio::endpoint(port));
+
+    capy::run_async(ioc.get_executor())(
+        accept_loop(acc, ioc));
+
+    ioc.run();
+
+    return 0;
+}
+----
+
+== Build
+
+[source,cmake]
+----
+add_executable(echo_server echo_server.cpp)
+target_link_libraries(echo_server PRIVATE Boost::capy Boost::corosio)
+----
+
+== Walkthrough
+
+=== TCP Acceptor
+
+[source,cpp]
+----
+corosio::io_context ioc;
+corosio::tcp_acceptor acc(ioc, corosio::endpoint(port));
+----
+
+The `io_context` drives all asynchronous I/O. The `tcp_acceptor` listens on the specified port. Corosio uses a flat namespace -- types like `tcp_socket`, `tcp_acceptor`, and `endpoint` live directly in `boost::corosio`.
+
+=== Accept Loop
+
+[source,cpp]
+----
+for (;;)
+{
+    corosio::tcp_socket peer(ioc);
+    auto [ec] = co_await acc.accept(peer);
+    // ... handle connection ...
+}
+----
+
+The accept loop runs forever, creating a new `tcp_socket` for each connection. `acc.accept(peer)` suspends the coroutine until a client connects.
+
+=== Echo Session
+
+[source,cpp]
+----
+auto [ec, n] = co_await sock.read_some(
+    capy::mutable_buffer(buf, sizeof(buf)));
+// ...
+auto [wec, wn] = co_await capy::write(
+    sock, capy::const_buffer(buf, n));
+----
+
+Each session reads data with `read_some` and writes it back with `write`. When the client disconnects, `read_some` returns an error and the loop exits.
+
+=== Concurrent Clients
+
+[source,cpp]
+----
+capy::run_async(ioc.get_executor())(
+    echo_session(std::move(peer)));
+----
+
+Each accepted connection moves the socket into a new task via `run_async`. The coroutine owns the socket for the lifetime of the session. Multiple clients are handled concurrently on the same `io_context`.
+
+== Testing
+
+Start the server:
+
+----
+$ ./echo_server 8080
+Listening on port 8080
+----
+
+Connect with netcat:
+
+----
+$ nc localhost 8080
+Hello
+Hello
+World
+World
+^C
+----
+
+Server output:
+
+----
+Listening on port 8080
+Connection from 127.0.0.1:54321
+----
+
+== Exercises
+
+1. Add a connection limit with graceful rejection
+2. Implement a simple command protocol (e.g., ECHO, QUIT, STATS)
+3. Add TLS support using Corosio's TLS streams
+
+== Next Steps
+
+* xref:7.examples/7j.stream-pipeline.adoc[Stream Pipeline] -- Data transformation chains
